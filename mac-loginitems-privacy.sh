@@ -48,10 +48,33 @@ icloud_base(){
 }
 
 computer_name_slug(){
+  # 原始函数保留，用于兼容旧逻辑。该函数基于计算机名生成安全化 slug。
   local name; name=$(/usr/sbin/scutil --get ComputerName 2>/dev/null || true)
   [[ -z "$name" ]] && name=$(/usr/sbin/scutil --get LocalHostName 2>/dev/null || true)
   [[ -z "$name" ]] && name="$(/usr/bin/hostname -s 2>/dev/null || echo Mac)"
   echo "$name" | /usr/bin/tr '[:space:]' '-' | /usr/bin/sed -E 's/[^[:alnum:]\-]+/-/g; s/-+/-/g; s/^-|-$//g'
+}
+
+# 生成设备标识符，格式为“型号名称-芯片名称-序列号”。
+# - 型号名称取自 system_profiler SPHardwareDataType 的 Model Name 字段，去除首尾空白并删除所有空格；
+# - 芯片名称取自 sysctl machdep.cpu.brand_string，去掉 "Apple" 前缀并删除所有空格和首尾空白；
+# - 序列号取自 system_profiler 的 Serial Number 字段，去除首尾空白；
+# 生成的 slug 使用连字符连接，合并连续连字符，并去除开头结尾的连字符。
+device_identifier_slug(){
+  # 获取型号名称并清理
+  local model_raw; model_raw=$(/usr/sbin/system_profiler SPHardwareDataType 2>/dev/null | /usr/bin/awk -F':' '/Model Name/{print $2; exit}' || true)
+  local model_clean; model_clean=$(echo "${model_raw}" | /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | /usr/bin/tr -d '[:space:]')
+  # 获取芯片品牌并去除 "Apple" 前缀及空白
+  local cpu_raw; cpu_raw=$(/usr/sbin/sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+  local cpu_trim; cpu_trim=$(echo "${cpu_raw}" | /usr/bin/sed -e 's/^Apple[[:space:]]*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  local cpu_clean; cpu_clean=$(echo "${cpu_trim}" | /usr/bin/tr -d '[:space:]')
+  # 获取序列号并清理
+  local serial_raw; serial_raw=$(/usr/sbin/system_profiler SPHardwareDataType 2>/dev/null | /usr/bin/awk -F':' '/Serial Number/{print $2; exit}' || true)
+  local serial_clean; serial_clean=$(echo "${serial_raw}" | /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  # 拼接为 slug
+  local slug="${model_clean}-${cpu_clean}-${serial_clean}"
+  slug=$(echo "$slug" | /usr/bin/sed -E 's/-{2,}/-/g; s/^-|-$//g')
+  printf '%s\n' "$slug"
 }
 
 user_display_slug(){
@@ -68,7 +91,8 @@ user_display_slug(){
 build_backup_root(){
   local base; base="$(icloud_base)" || { 
     err "未发现 iCloud Drive 路径。请在『系统设置 > Apple ID > iCloud > iCloud Drive』开启。"; return 1; }
-  local host; host="$(computer_name_slug)"
+  # 使用新的设备标识符代替电脑名，格式为“型号-芯片-序列号”
+  local host; host="$(device_identifier_slug)"
   local userseg; userseg="$(user_display_slug)"
   printf '%s\n' "${base}/BACKUP/${host}/${userseg}/Loginitems-Privacy"
 }
@@ -181,7 +205,8 @@ backup(){
   local dir="$BACKUP_ROOT/$(timestamp)"
   step "解析路径"
   info "控制台用户: $(console_user)"
-  info "电脑名(安全化): $(computer_name_slug)"
+  # 显示设备标识符，基于型号、芯片和序列号构成，用于路径命名
+  info "设备标识(安全化): $(device_identifier_slug)"
   info "用户显示名(安全化): $(user_display_slug)"
   info "iCloud 基路径: $(icloud_base || echo '未找到')"
   info "备份根目录: $dir"
