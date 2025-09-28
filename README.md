@@ -59,4 +59,5 @@
 版权：
 -------
 	+ 遵从MIT协议
-	+ 所有代码全部来自于 OpenAI ChatGPT 5 Pro 编写（仅经过微量删减）
+	+ 所有代码全部来自于 OpenAI ChatGPT 5 Pro + Agent 编写
+
