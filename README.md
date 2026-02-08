@@ -153,11 +153,11 @@
    
    > 聚合更新脚本，聚合了市面上所有主流的MacOS APP更新程序，包括 Homebrew 、 Mas 、 Sparkle 、 MacPorts 、 TopGreade 、MacUpdater 等 第三方更新软件。实现 一站式 + 后台静默执行 + 无人值守式 更新 。
 
- - ## [Migrate_MacApp_To_Homebrew](https://github.com/Accademia/Migrate_MacApp_To_Homebrew)  🔥🔥🔥🔥🔥 
+ - ## [Migrate_MacApp_To_Homebrew](https://github.com/Accademia/Migrate_MacApp_To_Homebrew)  🔥🔥
    
    > 扫描本机 App，生成可迁移到 Homebrew 的安装清单。
 
- - ## [Generate_Sudoers_For_Homebrew](https://github.com/Accademia/Generate_Sudoers_For_Homebrew)  🔥🔥🔥 
+ - ## [Generate_Sudoers_For_Homebrew](https://github.com/Accademia/Generate_Sudoers_For_Homebrew)  🔥🔥 
    
    > 生成 ，执行Homebrew升级时，所需的 sudoers 免密规则，便于当前脚本时，全自动更新（无人值守式更新）。
 
