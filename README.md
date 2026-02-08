@@ -44,15 +44,15 @@
 
 <br>
 
-#  [usercmd_backup_LoginitemsPrivacy](https://cdn.jsdelivr.net/gh/Accademia/BackUp_LoginitemsPrivacy_For_MacOS/usercmd_backup_LoginitemsPrivacy)  
+## 程序命令 ： [usercmd_backup_LoginitemsPrivacy](https://cdn.jsdelivr.net/gh/Accademia/BackUp_LoginitemsPrivacy_For_MacOS/usercmd_backup_LoginitemsPrivacy)  
 
-> ### https://cdn.jsdelivr.net/gh/Accademia/BackUp_LoginitemsPrivacy_For_MacOS/usercmd_backup_LoginitemsPrivacy
+> ### 下载链接：https://cdn.jsdelivr.net/gh/Accademia/BackUp_LoginitemsPrivacy_For_MacOS/usercmd_backup_LoginitemsPrivacy
 
 <br>
 
-#  [usercmd_restore_LoginitemsPrivacy](https://cdn.jsdelivr.net/gh/Accademia/BackUp_LoginitemsPrivacy_For_MacOS/usercmd_restore_LoginitemsPrivacy)   
+## 程序命令 ： [usercmd_restore_LoginitemsPrivacy](https://cdn.jsdelivr.net/gh/Accademia/BackUp_LoginitemsPrivacy_For_MacOS/usercmd_restore_LoginitemsPrivacy)   
 
-> ### https://cdn.jsdelivr.net/gh/Accademia/BackUp_LoginitemsPrivacy_For_MacOS/usercmd_restore_LoginitemsPrivacy
+> ### 下载链接：https://cdn.jsdelivr.net/gh/Accademia/BackUp_LoginitemsPrivacy_For_MacOS/usercmd_restore_LoginitemsPrivacy
 
 <br>
 <br>
