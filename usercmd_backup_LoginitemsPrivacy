@@ -1,0 +1,1913 @@
+#!/bin/bash
+set -u -o pipefail -E
+
+# 自动提权：非 root 场景下重新用 sudo 执行（默认开启，可用 AUTO_SUDO=0 关闭）
+# 说明：使用 -E 保留环境变量，避免丢失脚本内的开关配置
+if [ "$(id -u)" -ne 0 ] && [ "${AUTO_SUDO:-1}" = "1" ]; then
+    exec sudo -E "$0" "$@"
+fi
+# 路径：保存日志文件的路径
+# 根据当前运行环境动态确定 iCloud 云盘路径。若以 root 身份运行（例如通过 sudo 调用），
+# 则根据实际登录用户的家目录计算 iCloud 路径，保证日志和备份路径始终保存在真实用户的 iCloud 目录下。
+if [[ "$(id -u)" -eq 0 ]]; then
+    targetUser="${SUDO_USER:-$(stat -f '%Su' /dev/console)}"
+    targetHome=$(eval echo "~$targetUser")
+    ICLOUD_PATH="$targetHome/Library/Mobile Documents/com~apple~CloudDocs"
+else
+    ICLOUD_PATH="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+fi
+# 生成用于标识设备的目录名称。格式为“型号名称-芯片名称-序列号/用户名”。
+# 型号名称取自系统信息的 Model Name 并删除空格；芯片名称去掉 Apple 前缀并删除所有空格；序列号读取系统序列号。
+MODEL_NAME_RAW=$(system_profiler SPHardwareDataType 2>/dev/null | awk -F: '/Model Name/{print $2; exit}')
+MODEL_NAME_CLEAN=$(echo "${MODEL_NAME_RAW}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]]//g')
+CPU_BRAND_RAW=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+CPU_BRAND_TRIM=$(echo "${CPU_BRAND_RAW}" | sed 's/^Apple[[:space:]]*//;s/^[[:space:]]*//;s/[[:space:]]*$//')
+CPU_BRAND_CLEAN=$(echo "${CPU_BRAND_TRIM}" | sed 's/[[:space:]]//g')
+SERIAL_NUMBER_RAW=$(system_profiler SPHardwareDataType 2>/dev/null | awk -F: '/Serial Number/{print $2; exit}')
+SERIAL_NUMBER_CLEAN=$(echo "${SERIAL_NUMBER_RAW}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+# 为了确保无论脚本以哪种方式运行（普通用户/通过 sudo 提权等），日志目录均基于实际登录用户而不是当前有效 UID。
+# 如果当前 uid 为 0（root），优先使用 $SUDO_USER（sudo 调用者），否则从控制台获取活跃用户；
+# 否则直接使用 $USER 环境变量，若未设置则回退到控制台用户。
+if [[ "$(id -u)" -eq 0 ]]; then
+    # 以 root 运行时尝试还原到调用 sudo 的用户，若不存在则使用当前控制台登录用户
+    USER_NAME="${SUDO_USER:-$(stat -f '%Su' /dev/console)}"
+else
+    # 非 root 情况直接使用 USER 环境变量，若不存在则使用当前控制台登录用户
+    USER_NAME="${USER:-$(stat -f '%Su' /dev/console)}"
+fi
+
+# 如果以 root 身份运行，则对 tee 命令做降权处理，使所有日志写入操作在登录用户上下文中执行。
+if [ "$(id -u)" -eq 0 ]; then
+    __targetUser="${SUDO_USER:-$(stat -f '%Su' /dev/console)}"
+    __uid="$(id -u "$__targetUser" 2>/dev/null || echo "")"
+    if [ -n "$__uid" ]; then
+        __original_tee="$(command -v tee)"
+        tee() {
+            launchctl asuser "$__uid" sudo -n -u "$__targetUser" "$__original_tee" "$@"
+        }
+        # 定义安全 touch 函数：在 root 下通过登录用户身份创建文件
+        safe_touch() {
+            local __file="$1"
+            launchctl asuser "$__uid" sudo -n -u "$__targetUser" /usr/bin/touch "$__file"
+        }
+    else
+        # 如果无法获取 uid，则回退使用普通 touch
+        safe_touch() {
+            local __file="$1"
+            /usr/bin/touch "$__file"
+        }
+    fi
+else
+    # 非 root 身份运行时，safe_touch 直接调用系统 touch
+    safe_touch() {
+        local __file="$1"
+        /usr/bin/touch "$__file"
+    }
+fi
+DEVICE_DIR="${MODEL_NAME_CLEAN}-${CPU_BRAND_CLEAN}-${SERIAL_NUMBER_CLEAN}"
+# 清理多余的连字符
+DEVICE_DIR=$(echo "$DEVICE_DIR" | sed 's/--*/-/g; s/^-//; s/-$//')
+
+
+    # 尝试创建日志目录并设置 LOG_PATH。优先使用 iCloud 路径，创建失败则回退到主目录路径
+    tmp_log="$ICLOUD_PATH/LOG/${DEVICE_DIR}/${USER_NAME}"
+    if mkdir -p "$tmp_log" 2>/dev/null; then
+        LOG_PATH="$tmp_log"
+        log_created_in_icloud=1
+    else
+        fallback_home="${targetHome:-$HOME}"
+        LOG_PATH="$fallback_home/LOG/${DEVICE_DIR}/${USER_NAME}"
+        mkdir -p "$LOG_PATH"
+        log_created_in_icloud=0
+    fi
+
+# 保留原有 COMPUTER_NAME 变量以供其他逻辑使用
+# 根据当前脚本的执行身份，决定 sudo 命令是否强制使用非交互模式
+# 如果脚本以 root 身份运行（例如通过 sudo 调用），则后续内部调用 sudo 时添加 -n 选项，
+# 防止在无人值守执行时阻塞等待密码。如果脚本以普通用户身份运行，则允许 sudo 正常提示密码
+# 以便在交互式终端中完成相应操作。
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO_N_FLAG="-n"
+else
+    SUDO_N_FLAG=""
+fi
+export SUDO_N_FLAG
+LOG_FULL_LAST="$LOG_PATH/--UpdateFull-Last--.log"
+LOG_FILE="$LOG_PATH/Update_Auto.log"
+LOG_FULL_FILE="$LOG_PATH/UpdateFull.$(date +%Y-%m).log"
+# 独立脚本不写入日志，仅保留屏幕输出
+LOG_FULL_LAST="/dev/null"
+LOG_FILE="/dev/null"
+LOG_FULL_FILE="/dev/null"
+__resolve_active_user_context() {
+    ACTIVE_USER="$(stat -f '%Su' /dev/console 2>/dev/null || echo '')"
+    if [ -z "${ACTIVE_USER:-}" ] || [ "${ACTIVE_USER:-}" = "root" ]; then
+        ACTIVE_USER="${SUDO_USER:-${USER:-}}"
+    fi
+    ACTIVE_UID="$(id -u "$ACTIVE_USER" 2>/dev/null || echo '')"
+
+    # 获取用户 HOME（优先用 ~user 展开）
+    ACTIVE_HOME="$(eval echo "~$ACTIVE_USER" 2>/dev/null || echo '')"
+    if [ -z "${ACTIVE_HOME:-}" ] || [ "${ACTIVE_HOME:-}" = "~$ACTIVE_USER" ]; then
+        ACTIVE_HOME="/Users/$ACTIVE_USER"
+    fi
+
+    export ACTIVE_USER ACTIVE_UID ACTIVE_HOME
+}
+
+# 解析 macOS 版本信息
+__resolve_macos_version() {
+    MACOS_PRODUCT_VERSION="$(/usr/bin/sw_vers -productVersion 2>/dev/null || echo '')"
+    MACOS_BUILD_VERSION="$(/usr/bin/sw_vers -buildVersion 2>/dev/null || echo '')"
+
+    # 主版本号（例如：13 / 14 / 15 ... / 26）
+    MACOS_MAJOR="$(printf '%s' "${MACOS_PRODUCT_VERSION:-0}" | /usr/bin/awk -F. '{print $1}' 2>/dev/null)"
+    if ! [[ "${MACOS_MAJOR:-}" =~ ^[0-9]+$ ]]; then
+        MACOS_MAJOR=0
+    fi
+
+    export MACOS_PRODUCT_VERSION MACOS_BUILD_VERSION MACOS_MAJOR
+}
+
+# 确保 BACKUP_BASE / BACKUP_PATH / BACKUP_DATE 已初始化
+__ensure_backup_base_vars() {
+    __resolve_active_user_context
+
+    # 用户目录名：尽量与脚本既有逻辑保持一致（USER_NAME 为空时用 ACTIVE_USER）
+    if [ -z "${USER_NAME:-}" ] || [ "${USER_NAME:-}" = "root" ]; then
+        USER_NAME="$ACTIVE_USER"
+    fi
+
+    if [ -z "${BACKUP_DATE:-}" ]; then
+        BACKUP_DATE="$(date +%Y-%m-%d)"
+    fi
+    if [ -z "${BACKUP_BASE:-}" ]; then
+        BACKUP_BASE="$ICLOUD_PATH/BACKUP/$DEVICE_DIR"
+    fi
+    if [ -z "${BACKUP_PATH:-}" ]; then
+        BACKUP_PATH="$BACKUP_BASE/$USER_NAME"
+    fi
+
+    export USER_NAME BACKUP_DATE BACKUP_BASE BACKUP_PATH
+}
+
+# 在 root 场景下，把命令切换到 ACTIVE_USER 的 GUI 会话执行（用于 pluginkit / osascript / mkdir / cp 等）
+__run_as_active_user_gui() {
+    __resolve_active_user_context
+    if [ "$(id -u)" -eq 0 ] && [ -n "${ACTIVE_UID:-}" ] && [ "${ACTIVE_USER:-}" != "root" ]; then
+        launchctl asuser "$ACTIVE_UID" sudo -n -H -u "$ACTIVE_USER" "$@"
+    else
+        "$@"
+    fi
+}
+
+# ---------- 备份：LoginItems & Extensions ----------
+backup_loginitems_extensions() {
+    __ensure_backup_base_vars
+    __resolve_macos_version
+
+    local __strict="${LOGINITEMS_EXTENSIONS_STRICT:-1}"
+    local __export_osascript="${LOGINITEMS_EXPORT_OSASCRIPT:-0}"
+    local __backup_launchd="${LOGINITEMS_BACKUP_LAUNCHD:-1}"
+
+    # 目录名说明：
+    # - macOS 13+ 的「登录时打开」与「允许在后台」同源于 BTM（backgrounditems.btm）
+    # - 为避免重复备份，将两者合并，并与 Extensions 一起归档到同一目录
+    local __root_dir="$BACKUP_PATH/LoginItemsExtensions/$BACKUP_DATE"
+    local __loginitems_dir="$__root_dir/LoginItems"
+    local __extensions_dir="$__root_dir/Extensions"
+
+    local __ok=1
+
+    # --- 打印风格（与脚本其余部分一致：终端彩色标题 + 日志纯文本标题） ---
+    echo -e "\033[1;32m-----------------------------------------------\033[0m"
+    echo -e "\033[1;32m 备份 登录项与扩展（LoginItems & Extensions）    \033[0m"
+    echo -e "\033[1;32m-----------------------------------------------\033[0m"
+
+    echo -e "-------------------------------------------" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "备份 登录项与扩展（LoginItems & Extensions）" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "-------------------------------------------" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+
+    # 统一打印前缀：避免把颜色控制符写入日志文件
+    __li_info() {
+        printf "\033[1;34m[Info]\033[0m "
+        printf "[Info] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __li_ok() {
+        printf "\033[1;32m[OK]\033[0m   "
+        printf "[OK]   " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __li_warn() {
+        printf "\033[1;33m[Warn]\033[0m "
+        printf "[Warn] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __li_error() {
+        printf "\033[1;31m[ERROR]\033[0m  "
+        printf "[ERROR] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __li_has_rsync() {
+        [ -x "/usr/bin/rsync" ]
+    }
+    __li_sync_dir_user() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+
+        if [ ! -d "$__src" ]; then
+            __li_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        __run_as_active_user_gui /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __li_has_rsync; then
+            local __rsync_opts="-a"
+            local __del="${__launchd_delete:-1}"
+            if [ "$__del" = "1" ]; then
+                __rsync_opts="-a --delete"
+            fi
+            if __run_as_active_user_gui /usr/bin/rsync $__rsync_opts "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                if [ "$__del" = "1" ]; then
+                    __li_ok "已恢复 ${__label}（已同步并删除多余项）"
+                else
+                    __li_ok "已恢复 ${__label}（已同步，未删除多余项）"
+                fi
+                return 0
+            fi
+            __li_warn "恢复 ${__label} 失败（以当前用户 rsync 同步失败），尝试 sudo 强制恢复"
+            if sudo $SUDO_N_FLAG /usr/bin/rsync $__rsync_opts "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                sudo $SUDO_N_FLAG /usr/sbin/chown -R "$ACTIVE_USER" "$__dst" 2>/dev/null || true
+                if [ "$__del" = "1" ]; then
+                    __li_ok "已用 sudo 恢复 ${__label}（已同步并删除多余项）"
+                else
+                    __li_ok "已用 sudo 恢复 ${__label}（已同步，未删除多余项）"
+                fi
+                return 0
+            fi
+            __li_error "恢复 ${__label} 失败（rsync 同步失败）"
+            return 1
+        fi
+
+        __li_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        return 1
+    }
+    __li_sync_dir_root() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+
+        if [ ! -d "$__src" ]; then
+            __li_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        sudo $SUDO_N_FLAG /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __li_has_rsync; then
+            local __rsync_opts="-a"
+            local __del="${__launchd_delete:-1}"
+            if [ "$__del" = "1" ]; then
+                __rsync_opts="-a --delete"
+            fi
+            if sudo $SUDO_N_FLAG /usr/bin/rsync $__rsync_opts "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                if [ "$__del" = "1" ]; then
+                    __li_ok "已恢复 ${__label}（已同步并删除多余项）"
+                else
+                    __li_ok "已恢复 ${__label}（已同步，未删除多余项）"
+                fi
+                return 0
+            fi
+            __li_error "恢复 ${__label} 失败（rsync 同步失败）"
+            return 1
+        fi
+
+        __li_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        return 1
+    }
+    __li_has_rsync() {
+        [ -x "/usr/bin/rsync" ]
+    }
+    __li_sync_dir_user() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+
+        if [ ! -d "$__src" ]; then
+            __li_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        __run_as_active_user_gui /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __li_has_rsync; then
+            local __rsync_opts="-a"
+            local __del="${__launchd_delete:-1}"
+            if [ "$__del" = "1" ]; then
+                __rsync_opts="-a --delete"
+            fi
+            if __run_as_active_user_gui /usr/bin/rsync $__rsync_opts "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                if [ "$__del" = "1" ]; then
+                    __li_ok "已恢复 ${__label}（已同步并删除多余项）"
+                else
+                    __li_ok "已恢复 ${__label}（已同步，未删除多余项）"
+                fi
+                return 0
+            fi
+            __li_warn "恢复 ${__label} 失败（以当前用户 rsync 同步失败），尝试 sudo 强制恢复"
+            if sudo $SUDO_N_FLAG /usr/bin/rsync $__rsync_opts "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                sudo $SUDO_N_FLAG /usr/sbin/chown -R "$ACTIVE_USER" "$__dst" 2>/dev/null || true
+                if [ "$__del" = "1" ]; then
+                    __li_ok "已用 sudo 恢复 ${__label}（已同步并删除多余项）"
+                else
+                    __li_ok "已用 sudo 恢复 ${__label}（已同步，未删除多余项）"
+                fi
+                return 0
+            fi
+            __li_error "恢复 ${__label} 失败（rsync 同步失败）"
+            return 1
+        fi
+
+        __li_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        return 1
+    }
+    __li_sync_dir_root() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+
+        if [ ! -d "$__src" ]; then
+            __li_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        sudo $SUDO_N_FLAG /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __li_has_rsync; then
+            local __rsync_opts="-a"
+            local __del="${__launchd_delete:-1}"
+            if [ "$__del" = "1" ]; then
+                __rsync_opts="-a --delete"
+            fi
+            if sudo $SUDO_N_FLAG /usr/bin/rsync $__rsync_opts "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                if [ "$__del" = "1" ]; then
+                    __li_ok "已恢复 ${__label}（已同步并删除多余项）"
+                else
+                    __li_ok "已恢复 ${__label}（已同步，未删除多余项）"
+                fi
+                return 0
+            fi
+            __li_error "恢复 ${__label} 失败（rsync 同步失败）"
+            return 1
+        fi
+
+        __li_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        return 1
+    }
+    __li_has_rsync() {
+        [ -x "/usr/bin/rsync" ]
+    }
+    __li_copy_dir_user() {
+        local __src="$1"
+        local __dst="$2"
+        if __li_has_rsync; then
+            __run_as_active_user_gui /usr/bin/rsync -a "$__src/" "$__dst/" 2>/dev/null
+        else
+            __run_as_active_user_gui /usr/bin/ditto "$__src" "$__dst" 2>/dev/null
+        fi
+    }
+    __li_copy_dir_root() {
+        local __src="$1"
+        local __dst="$2"
+        if __li_has_rsync; then
+            sudo $SUDO_N_FLAG /usr/bin/rsync -a "$__src/" "$__dst/" 2>/dev/null
+        else
+            sudo $SUDO_N_FLAG /usr/bin/ditto "$__src" "$__dst" 2>/dev/null
+        fi
+    }
+    __li_write_plist_list_user() {
+        local __src="$1"
+        local __dst="$2"
+        __run_as_active_user_gui /bin/sh -c '/usr/bin/find "$1" -maxdepth 1 -type f -name "*.plist" -exec /usr/bin/basename {} \; 2>/dev/null | /usr/bin/sort > "$2"' _ "$__src" "$__dst"
+    }
+    __li_write_plist_list_root() {
+        local __src="$1"
+        local __dst="$2"
+        sudo $SUDO_N_FLAG /bin/sh -c '/usr/bin/find "$1" -maxdepth 1 -type f -name "*.plist" -exec /usr/bin/basename {} \; 2>/dev/null | /usr/bin/sort > "$2"' _ "$__src" "$__dst" || true
+        sudo $SUDO_N_FLAG /usr/sbin/chown "$ACTIVE_USER" "$__dst" 2>/dev/null || true
+    }
+
+    __li_info "macOS 版本：${MACOS_PRODUCT_VERSION} (${MACOS_BUILD_VERSION})"
+    __li_info "备份路径：'$__root_dir'"
+
+    # 目录准备
+    if ! __run_as_active_user_gui /bin/mkdir -p "$__loginitems_dir" "$__extensions_dir" 2>/dev/null; then
+        __li_error "创建备份目录失败：'$__root_dir'"
+        __ok=0
+    fi
+
+    # ------------------------------
+    # LoginItems（登录项 / 允许后台）
+    # ------------------------------
+    if [ "$MACOS_MAJOR" -ge 13 ]; then
+        __li_info "检测到 macOS >= 13：LoginItems/Allow in Background 以 BTM 数据库（backgrounditems.btm）为唯一可信数据源"
+
+        # BTM 数据库（同源）
+        local __btm_src="$ACTIVE_HOME/Library/Application Support/com.apple.backgroundtaskmanagementagent/backgrounditems.btm"
+        local __btm_dst_dir="$__loginitems_dir/com.apple.backgroundtaskmanagementagent"
+        local __btm_dst_file="$__btm_dst_dir/backgrounditems.btm"
+
+        if ! __run_as_active_user_gui /bin/mkdir -p "$__btm_dst_dir" 2>/dev/null; then
+            __li_error "创建 BTM 备份目录失败：'$__btm_dst_dir'"
+            __ok=0
+        fi
+
+        if [ -f "$__btm_src" ]; then
+            if __run_as_active_user_gui /bin/cp -f "$__btm_src" "$__btm_dst_file" 2>/dev/null && [ -s "$__btm_dst_file" ]; then
+                __li_ok "已备份 BTM：'$__btm_dst_file' (size=$(stat -f%z "$__btm_dst_file" 2>/dev/null || stat -c%s "$__btm_dst_file" 2>/dev/null))"
+            else
+                __li_error "备份 BTM 失败：'$__btm_src' -> '$__btm_dst_file'"
+                __ok=0
+            fi
+        else
+            __li_error "未找到 BTM 数据库：'$__btm_src'"
+            __ok=0
+        fi
+
+        # 旧版 plist（审计/兼容备份：有则备份，无则不创建空目录）
+        local __legacy_loginitems_plist="$ACTIVE_HOME/Library/Preferences/com.apple.loginitems.plist"
+        local __legacy_btm_plist="$ACTIVE_HOME/Library/Preferences/com.apple.backgroundtaskmanagementagent.plist"
+        local __legacy_dir="$__loginitems_dir/LegacyPlists"
+        local __legacy_any=0
+
+        if [ -f "$__legacy_loginitems_plist" ] || [ -f "$__legacy_btm_plist" ]; then
+            __legacy_any=1
+            __run_as_active_user_gui /bin/mkdir -p "$__legacy_dir" 2>/dev/null
+
+            if [ -f "$__legacy_loginitems_plist" ]; then
+                __run_as_active_user_gui /bin/cp -f "$__legacy_loginitems_plist" "$__legacy_dir/" 2>/dev/null && __li_ok "已备份 legacy plist：'$__legacy_dir/$(basename "$__legacy_loginitems_plist")'"
+            else
+                __li_info "未发现 com.apple.loginitems.plist（macOS >= 13 非主要数据源，跳过不影响回滚）"
+            fi
+
+            if [ -f "$__legacy_btm_plist" ]; then
+                __run_as_active_user_gui /bin/cp -f "$__legacy_btm_plist" "$__legacy_dir/" 2>/dev/null && __li_ok "已备份 legacy plist：'$__legacy_dir/$(basename "$__legacy_btm_plist")'"
+            else
+                __li_info "未发现 com.apple.backgroundtaskmanagementagent.plist（macOS >= 13 非主要数据源，跳过不影响回滚）"
+            fi
+        else
+            __li_info "未发现 legacy plist（macOS >= 13 非主要数据源），已跳过创建 LegacyPlists 目录"
+        fi
+
+        # OpenAtLogin.list（可选：通过 UI 层导出，可能触发自动化权限提示；默认关闭）
+        if [ "$__export_osascript" = "1" ]; then
+            if command -v osascript >/dev/null 2>&1; then
+                local __oal_file="$__loginitems_dir/OpenAtLogin.list"
+                local __tmp_list="/tmp/OpenAtLogin_${BACKUP_DATE}_$$.list"
+                if __run_as_active_user_gui /usr/bin/osascript <<'EOF' > "$__tmp_list" 2>/dev/null
+tell application "System Events"
+    set loginItemsList to every login item
+    repeat with i from 1 to (count loginItemsList)
+        set loginItem to item i of loginItemsList
+        set itemName to the name of loginItem
+        set itemPath to the path of loginItem
+        set itemHidden to the hidden of loginItem
+        log itemName & " | " & itemPath & " | Hidden: " & itemHidden
+    end repeat
+end tell
+EOF
+                then
+                    __run_as_active_user_gui /bin/cp -f "$__tmp_list" "$__oal_file" 2>/dev/null
+                    if [ -s "$__oal_file" ]; then
+                        __li_ok "已导出 OpenAtLogin 明细：'$__oal_file'（排查用；核心回滚不依赖此文件）"
+                    else
+                        __li_warn "OpenAtLogin.list 导出为空：'$__oal_file'"
+                    fi
+                else
+                    __li_warn "导出 OpenAtLogin.list 失败（可能缺少自动化权限；不影响核心回滚）"
+                fi
+                __run_as_active_user_gui /bin/rm -f "$__tmp_list" 2>/dev/null || true
+            else
+                __li_warn "未找到 osascript（已跳过 OpenAtLogin.list 导出；不影响核心回滚）"
+            fi
+        else
+            __li_info "已跳过 OpenAtLogin.list 导出（可设置 LOGINITEMS_EXPORT_OSASCRIPT=1 启用；可能触发自动化权限提示）"
+        fi
+
+    else
+        # macOS < 13：仍以 plist + UI login items 为主
+        __li_info "检测到 macOS < 13：将备份 legacy plist 与 Login Items 列表（OpenAtLogin.list）"
+
+        local __legacy_dir="$__loginitems_dir/LegacyLoginItems"
+        __run_as_active_user_gui /bin/mkdir -p "$__legacy_dir" 2>/dev/null
+
+        local __btm_plist="$ACTIVE_HOME/Library/Preferences/com.apple.backgroundtaskmanagementagent.plist"
+        if [ -f "$__btm_plist" ]; then
+            __run_as_active_user_gui /bin/cp -f "$__btm_plist" "$__legacy_dir/" 2>/dev/null && __li_ok "已备份 legacy BTM plist：'$__legacy_dir/$(basename "$__btm_plist")'"
+        else
+            __li_warn "未找到 legacy BTM plist：'$__btm_plist'"
+        fi
+
+        # Login Items（Open at Login）
+        if command -v osascript >/dev/null 2>&1; then
+            local __oal_file="$__loginitems_dir/OpenAtLogin.list"
+            local __tmp_list="/tmp/OpenAtLogin_${BACKUP_DATE}_$$.list"
+            if __run_as_active_user_gui /usr/bin/osascript <<'EOF' > "$__tmp_list" 2>/dev/null
+tell application "System Events"
+    set loginItemsList to every login item
+    repeat with i from 1 to (count loginItemsList)
+        set loginItem to item i of loginItemsList
+        set itemName to the name of loginItem
+        set itemPath to the path of loginItem
+        set itemHidden to the hidden of loginItem
+        log itemName & " | " & itemPath & " | Hidden: " & itemHidden
+    end repeat
+end tell
+EOF
+            then
+                __run_as_active_user_gui /bin/cp -f "$__tmp_list" "$__oal_file" 2>/dev/null
+                if [ -s "$__oal_file" ]; then
+                    __li_ok "已导出 OpenAtLogin 明细：'$__oal_file'"
+                else
+                    __li_warn "OpenAtLogin.list 导出为空：'$__oal_file'"
+                fi
+            else
+                __li_error "导出 OpenAtLogin.list 失败（macOS < 13 可能影响回滚）"
+                __ok=0
+            fi
+            __run_as_active_user_gui /bin/rm -f "$__tmp_list" 2>/dev/null || true
+        else
+            __li_error "未找到 osascript（macOS < 13 可能影响回滚）"
+            __ok=0
+        fi
+    fi
+
+    # ------------------------------
+    # LaunchAgents / LaunchDaemons（启动项）
+    # ------------------------------
+    if [ "$__backup_launchd" = "1" ]; then
+        __li_info "开始备份 LaunchAgents / LaunchDaemons（启动项）"
+
+        local __launchd_dir="$__loginitems_dir/Launchd"
+        local __launchagents_user_src="$ACTIVE_HOME/Library/LaunchAgents"
+        local __launchagents_user_dst="$__launchd_dir/LaunchAgents/User"
+        local __launchagents_system_src="/Library/LaunchAgents"
+        local __launchagents_system_dst="$__launchd_dir/LaunchAgents/System"
+        local __launchdaemons_system_src="/Library/LaunchDaemons"
+        local __launchdaemons_system_dst="$__launchd_dir/LaunchDaemons/System"
+
+        __run_as_active_user_gui /bin/mkdir -p "$__launchagents_user_dst" "$__launchagents_system_dst" "$__launchdaemons_system_dst" 2>/dev/null || true
+
+        # 用户 LaunchAgents
+        if [ -d "$__launchagents_user_src" ]; then
+            if __li_copy_dir_user "$__launchagents_user_src" "$__launchagents_user_dst"; then
+                __li_ok "已备份 用户 LaunchAgents：'$__launchagents_user_dst'"
+                __li_write_plist_list_user "$__launchagents_user_src" "$__launchagents_user_dst/launchagents_user.list" || true
+            else
+                __li_error "备份 用户 LaunchAgents 失败：'$__launchagents_user_src'"
+                __ok=0
+            fi
+        else
+            __li_info "未发现 用户 LaunchAgents：'$__launchagents_user_src'"
+        fi
+
+        # 系统 LaunchAgents
+        if [ -d "$__launchagents_system_src" ]; then
+            if __li_copy_dir_root "$__launchagents_system_src" "$__launchagents_system_dst"; then
+                __li_ok "已备份 系统 LaunchAgents：'$__launchagents_system_dst'"
+                __li_write_plist_list_root "$__launchagents_system_src" "$__launchagents_system_dst/launchagents_system.list"
+            else
+                __li_error "备份 系统 LaunchAgents 失败：'$__launchagents_system_src'"
+                __ok=0
+            fi
+        else
+            __li_info "未发现 系统 LaunchAgents：'$__launchagents_system_src'"
+        fi
+
+        # 系统 LaunchDaemons
+        if [ -d "$__launchdaemons_system_src" ]; then
+            if __li_copy_dir_root "$__launchdaemons_system_src" "$__launchdaemons_system_dst"; then
+                __li_ok "已备份 系统 LaunchDaemons：'$__launchdaemons_system_dst'"
+                __li_write_plist_list_root "$__launchdaemons_system_src" "$__launchdaemons_system_dst/launchdaemons_system.list"
+            else
+                __li_error "备份 系统 LaunchDaemons 失败：'$__launchdaemons_system_src'"
+                __ok=0
+            fi
+        else
+            __li_info "未发现 系统 LaunchDaemons：'$__launchdaemons_system_src'"
+        fi
+    else
+        __li_info "已跳过 LaunchAgents / LaunchDaemons 备份（LOGINITEMS_BACKUP_LAUNCHD=0）"
+    fi
+
+    # ------------------------------
+    # Extensions（扩展/插件/系统扩展）
+    # ------------------------------
+    if command -v pluginkit >/dev/null 2>&1; then
+        local __pk_all="$__extensions_dir/pluginkit_match_all.txt"
+        local __pk_elections="$__extensions_dir/pluginkit_elections.txt"
+
+        if __run_as_active_user_gui pluginkit -m 2>/dev/null | tee "$__pk_all" >/dev/null; then
+            # 仅抽取“+/-”行，便于快速对比授权变化
+            grep -E '^[+-]' "$__pk_all" > "$__pk_elections" 2>/dev/null || true
+            __li_ok "已备份 Extensions（pluginkit -m）：'$__pk_all'"
+            __li_ok "已备份 Extensions election（+/-）：'$__pk_elections'"
+        else
+            __li_error "pluginkit -m 执行失败"
+            __ok=0
+        fi
+    else
+        __li_error "未找到 pluginkit 命令（无法备份 Extensions）"
+        __ok=0
+    fi
+
+    # systemextensionsctl（系统扩展）
+    if command -v systemextensionsctl >/dev/null 2>&1; then
+        local __se_file="$__extensions_dir/systemextensionsctl_list.txt"
+        if __run_as_active_user_gui systemextensionsctl list 2>&1 | tee "$__se_file" >/dev/null; then
+            [ -s "$__se_file" ] && __li_ok "已备份 System Extensions：'$__se_file'"
+        else
+            # 尝试提升权限再次导出（best effort）
+            if sudo $SUDO_N_FLAG systemextensionsctl list 2>&1 | tee "$__se_file" >/dev/null; then
+                sudo $SUDO_N_FLAG /usr/sbin/chown "$ACTIVE_USER" "$__se_file" 2>/dev/null || true
+                [ -s "$__se_file" ] && __li_ok "已备份 System Extensions（sudo）：'$__se_file'"
+            else
+                __li_error "systemextensionsctl list 执行失败（无法备份 System Extensions）"
+                __ok=0
+            fi
+        fi
+    else
+        __li_warn "未找到 systemextensionsctl（已跳过 System Extensions 列表导出）"
+    fi
+
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+
+    if [ "$__ok" = "1" ]; then
+        echo -e "\033[1;32m[OK] 备份 登录项与扩展  运行已完成 ✅ \033[0m"
+        echo -e "[OK] 备份 登录项与扩展  运行已完成 ✅ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 0
+    fi
+
+    echo -e "\033[1;31m[ERROR] 备份 登录项与扩展  未完整完成 ❌ \033[0m"
+    echo -e "[ERROR] 备份 登录项与扩展  未完整完成 ❌ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+
+    if [ "$__strict" = "1" ]; then
+        echo -e "\033[1;31m[ERROR] 严格模式开启（LOGINITEMS_EXTENSIONS_STRICT=1）：将阻止继续执行更新，避免无法回滚\033[0m"
+        echo -e "[ERROR] 严格模式开启（LOGINITEMS_EXTENSIONS_STRICT=1）：将阻止继续执行更新，避免无法回滚" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 1
+    fi
+
+    echo -e "\033[1;33m[Warn] 严格模式关闭（LOGINITEMS_EXTENSIONS_STRICT=0）：将继续执行更新，但回滚能力可能不完整 ⚠️ \033[0m"
+    echo -e "[Warn] 严格模式关闭（LOGINITEMS_EXTENSIONS_STRICT=0）：将继续执行更新，但回滚能力可能不完整 ⚠️ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    return 0
+}
+# ---------- 恢复：LoginItems & Extensions ----------
+restore_loginitems_extensions() {
+    __ensure_backup_base_vars
+    __resolve_macos_version
+
+    local __strict="${LOGINITEMS_EXTENSIONS_STRICT:-1}"
+    local __restore_launchd="${LOGINITEMS_BACKUP_LAUNCHD:-1}"
+    local __launchd_delete="${LOGINITEMS_LAUNCHD_RESTORE_DELETE:-1}"
+    local __restore_osascript="${LOGINITEMS_RESTORE_OSASCRIPT:-1}"
+
+    # 兼容旧目录名：LoginItems-Extensions -> LoginItemsExtensions
+    local __root_dir_new="$BACKUP_PATH/LoginItemsExtensions/$BACKUP_DATE"
+    local __root_dir_old="$BACKUP_PATH/LoginItems-Extensions/$BACKUP_DATE"
+    local __root_dir="$__root_dir_new"
+
+    if [ ! -d "$__root_dir_new" ] && [ -d "$__root_dir_old" ]; then
+        __root_dir="$__root_dir_old"
+    fi
+
+    local __loginitems_dir="$__root_dir/LoginItems"
+    local __extensions_dir="$__root_dir/Extensions"
+
+    local __ok=1
+
+    # --- 打印风格（与脚本其余部分一致） ---
+    echo -e "\033[1;32m-----------------------------------------------\033[0m"
+    echo -e "\033[1;32m 恢复 登录项与扩展（LoginItems & Extensions）    \033[0m"
+    echo -e "\033[1;32m-----------------------------------------------\033[0m"
+
+    echo -e "-------------------------------------------" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "恢复 登录项与扩展（LoginItems & Extensions）" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "-------------------------------------------" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+
+    __li_info() {
+        printf "\033[1;34m[Info]\033[0m "
+        printf "[Info] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __li_ok() {
+        printf "\033[1;32m[OK]\033[0m   "
+        printf "[OK]   " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __li_warn() {
+        printf "\033[1;33m[Warn]\033[0m "
+        printf "[Warn] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __li_error() {
+        printf "\033[1;31m[ERROR]\033[0m  "
+        printf "[ERROR] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __li_has_rsync() {
+        [ -x "/usr/bin/rsync" ]
+    }
+    __li_sync_dir_user() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+
+        if [ ! -d "$__src" ]; then
+            __li_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        __run_as_active_user_gui /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __li_has_rsync; then
+            local __rsync_opts="-a"
+            local __del="${__launchd_delete:-1}"
+            if [ "$__del" = "1" ]; then
+                __rsync_opts="-a --delete"
+            fi
+            if __run_as_active_user_gui /usr/bin/rsync $__rsync_opts "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                if [ "$__del" = "1" ]; then
+                    __li_ok "已恢复 ${__label}（已同步并删除多余项）"
+                else
+                    __li_ok "已恢复 ${__label}（已同步，未删除多余项）"
+                fi
+                return 0
+            fi
+            __li_warn "恢复 ${__label} 失败（以当前用户 rsync 同步失败），尝试 sudo 强制恢复"
+            if sudo $SUDO_N_FLAG /usr/bin/rsync $__rsync_opts "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                sudo $SUDO_N_FLAG /usr/sbin/chown -R "$ACTIVE_USER" "$__dst" 2>/dev/null || true
+                if [ "$__del" = "1" ]; then
+                    __li_ok "已用 sudo 恢复 ${__label}（已同步并删除多余项）"
+                else
+                    __li_ok "已用 sudo 恢复 ${__label}（已同步，未删除多余项）"
+                fi
+                return 0
+            fi
+            __li_error "恢复 ${__label} 失败（rsync 同步失败）"
+            return 1
+        fi
+
+        __li_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        return 1
+    }
+    __li_sync_dir_root() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+
+        if [ ! -d "$__src" ]; then
+            __li_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        sudo $SUDO_N_FLAG /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __li_has_rsync; then
+            local __rsync_opts="-a"
+            local __del="${__launchd_delete:-1}"
+            if [ "$__del" = "1" ]; then
+                __rsync_opts="-a --delete"
+            fi
+            if sudo $SUDO_N_FLAG /usr/bin/rsync $__rsync_opts "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                if [ "$__del" = "1" ]; then
+                    __li_ok "已恢复 ${__label}（已同步并删除多余项）"
+                else
+                    __li_ok "已恢复 ${__label}（已同步，未删除多余项）"
+                fi
+                return 0
+            fi
+            __li_error "恢复 ${__label} 失败（rsync 同步失败）"
+            return 1
+        fi
+
+        __li_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        return 1
+    }
+
+    __li_info "macOS 版本：${MACOS_PRODUCT_VERSION} (${MACOS_BUILD_VERSION})"
+    __li_info "恢复来源：'$__root_dir'"
+
+    if [ ! -d "$__root_dir" ]; then
+        __li_error "未找到备份目录：'$__root_dir_new'（或旧目录：'$__root_dir_old'）"
+        if [ "$__strict" = "1" ]; then
+            __li_error "严格模式开启（LOGINITEMS_EXTENSIONS_STRICT=1）：将阻止继续执行后续恢复"
+            echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+            echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+            return 1
+        fi
+        __li_warn "严格模式关闭（LOGINITEMS_EXTENSIONS_STRICT=0）：跳过本项恢复"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 0
+    fi
+
+    # ------------------------------
+    # LoginItems（核心：BTM / legacy）
+    # ------------------------------
+    if [ "$MACOS_MAJOR" -ge 13 ]; then
+        __li_info "检测到 macOS >= 13：将恢复 BTM 数据库（backgrounditems.btm）"
+
+        local __btm_backup_file="$__loginitems_dir/com.apple.backgroundtaskmanagementagent/backgrounditems.btm"
+        local __btm_dst_dir="$ACTIVE_HOME/Library/Application Support/com.apple.backgroundtaskmanagementagent"
+        local __btm_dst_file="$__btm_dst_dir/backgrounditems.btm"
+
+        if [ -s "$__btm_backup_file" ]; then
+            __run_as_active_user_gui /bin/mkdir -p "$__btm_dst_dir" 2>/dev/null || true
+
+            # 尝试停止/重启 BTM agent（best effort）
+            __run_as_active_user_gui launchctl kickstart -k gui/$(id -u)/com.apple.backgroundtaskmanagementagent 2>/dev/null || true
+
+            # 备份当前文件（用于回退恢复本次恢复操作）
+            if [ -f "$__btm_dst_file" ]; then
+                local __stamp="$(date '+%Y%m%d-%H%M%S')"
+                __run_as_active_user_gui /bin/cp -f "$__btm_dst_file" "${__btm_dst_file}.pre_restore.${__stamp}.bak" 2>/dev/null || true
+            fi
+
+            if __run_as_active_user_gui /bin/cp -f "$__btm_backup_file" "$__btm_dst_file" 2>/dev/null; then
+                # 轻量校验：size/sha（best effort）
+                local __sha_src=""
+                local __sha_dst=""
+                __sha_src="$(shasum -a 256 "$__btm_backup_file" 2>/dev/null | awk '{print $1}' || true)"
+                __sha_dst="$(shasum -a 256 "$__btm_dst_file" 2>/dev/null | awk '{print $1}' || true)"
+
+                if [ -n "$__sha_src" ] && [ -n "$__sha_dst" ] && [ "$__sha_src" != "$__sha_dst" ]; then
+                    __li_error "恢复 BTM 后校验失败：sha256 不一致（src=$__sha_src dst=$__sha_dst）"
+                    __ok=0
+                else
+                    __li_ok "已恢复 BTM：'$__btm_dst_file'"
+                fi
+            else
+                __li_error "恢复 BTM 失败：'$__btm_backup_file' -> '$__btm_dst_file'"
+                __ok=0
+            fi
+
+            # kickstart 再来一次（best effort）
+            __run_as_active_user_gui launchctl kickstart -k gui/$(id -u)/com.apple.backgroundtaskmanagementagent 2>/dev/null || true
+        else
+            __li_error "备份中未找到可用的 BTM 文件：'$__btm_backup_file'"
+            __ok=0
+        fi
+
+        # 可选：按 OpenAtLogin.list 恢复 Login Items（可能触发自动化权限提示）
+        local __oal_file="$__loginitems_dir/OpenAtLogin.list"
+        if [ -s "$__oal_file" ] && [ "$__restore_osascript" = "1" ]; then
+            if command -v osascript >/dev/null 2>&1; then
+                __li_info "尝试按 OpenAtLogin.list 恢复 Login Items（可能触发自动化权限提示）"
+                if __run_as_active_user_gui /usr/bin/osascript - "$__oal_file" <<'EOF' >/dev/null 2>&1
+on run argv
+    if (count of argv) = 0 then return
+    set srcPath to item 1 of argv
+    set srcFile to POSIX file srcPath
+    set srcText to read srcFile
+    set theLines to paragraphs of srcText
+    tell application "System Events"
+        delete every login item
+        repeat with L in theLines
+            set L to L as text
+            if L is not "" then
+                set {theName, thePath, theHidden} to my parseLine(L)
+                if thePath is not "" then
+                    make new login item at end with properties {name:theName, path:thePath, hidden:theHidden}
+                end if
+            end if
+        end repeat
+    end tell
+end run
+
+on parseLine(L)
+    set AppleScript's text item delimiters to " | "
+    set parts to text items of L
+    set AppleScript's text item delimiters to ""
+    if (count of parts) < 3 then return {L, "", false}
+    set theName to item 1 of parts
+    set thePath to item 2 of parts
+    set theHiddenText to item 3 of parts
+    if theHiddenText contains "true" then
+        set theHidden to true
+    else
+        set theHidden to false
+    end if
+    return {theName, thePath, theHidden}
+end parseLine
+EOF
+                then
+                    __li_ok "已按 OpenAtLogin.list 恢复 Login Items（macOS >= 13 为补充步骤）"
+                else
+                    __li_warn "按 OpenAtLogin.list 恢复失败（可能缺少自动化权限；不影响 BTM 核心回滚）"
+                fi
+            else
+                __li_warn "未找到 osascript，已跳过 OpenAtLogin.list 恢复"
+            fi
+        fi
+    else
+        __li_info "检测到 macOS < 13：将按 legacy plist 恢复（best effort）"
+
+        local __btm_plist_backup="$__loginitems_dir/LegacyLoginItems/com.apple.backgroundtaskmanagementagent.plist"
+        local __btm_plist_dst="$ACTIVE_HOME/Library/Preferences/com.apple.backgroundtaskmanagementagent.plist"
+
+        if [ -f "$__btm_plist_backup" ]; then
+            if __run_as_active_user_gui /bin/cp -f "$__btm_plist_backup" "$__btm_plist_dst" 2>/dev/null; then
+                __li_ok "已恢复 legacy BTM plist：'$__btm_plist_dst'"
+            else
+                __li_error "恢复 legacy BTM plist 失败：'$__btm_plist_backup' -> '$__btm_plist_dst'"
+                __ok=0
+            fi
+        else
+            __li_warn "未找到 legacy BTM plist 备份：'$__btm_plist_backup'"
+        fi
+
+        # OpenAtLogin.list：按需写回系统 Login Items
+        local __oal_file="$__loginitems_dir/OpenAtLogin.list"
+        if [ -s "$__oal_file" ]; then
+            if [ "$__restore_osascript" = "1" ]; then
+                if command -v osascript >/dev/null 2>&1; then
+                    __li_info "尝试按 OpenAtLogin.list 恢复 Login Items（可能触发自动化权限提示）"
+                    if __run_as_active_user_gui /usr/bin/osascript - "$__oal_file" <<'EOF' >/dev/null 2>&1
+on run argv
+    if (count of argv) = 0 then return
+    set srcPath to item 1 of argv
+    set srcFile to POSIX file srcPath
+    set srcText to read srcFile
+    set theLines to paragraphs of srcText
+    tell application "System Events"
+        delete every login item
+        repeat with L in theLines
+            set L to L as text
+            if L is not "" then
+                set {theName, thePath, theHidden} to my parseLine(L)
+                if thePath is not "" then
+                    make new login item at end with properties {name:theName, path:thePath, hidden:theHidden}
+                end if
+            end if
+        end repeat
+    end tell
+end run
+
+on parseLine(L)
+    set AppleScript's text item delimiters to " | "
+    set parts to text items of L
+    set AppleScript's text item delimiters to ""
+    if (count of parts) < 3 then return {L, "", false}
+    set theName to item 1 of parts
+    set thePath to item 2 of parts
+    set theHiddenText to item 3 of parts
+    if theHiddenText contains "true" then
+        set theHidden to true
+    else
+        set theHidden to false
+    end if
+    return {theName, thePath, theHidden}
+end parseLine
+EOF
+                    then
+                        __li_ok "已按 OpenAtLogin.list 恢复 Login Items"
+                    else
+                        __li_error "按 OpenAtLogin.list 恢复 Login Items 失败（可能缺少自动化权限）"
+                        __ok=0
+                    fi
+                else
+                    __li_error "未找到 osascript，无法恢复 Login Items"
+                    __ok=0
+                fi
+            else
+                __li_warn "已禁用 Login Items 自动恢复（LOGINITEMS_RESTORE_OSASCRIPT=0）"
+            fi
+        else
+            __li_error "未找到 OpenAtLogin.list，无法恢复 Login Items"
+            __ok=0
+        fi
+    fi
+
+    # ------------------------------
+    # LaunchAgents / LaunchDaemons（启动项）
+    # ------------------------------
+    if [ "$__restore_launchd" = "1" ]; then
+        __li_info "开始恢复 LaunchAgents / LaunchDaemons（启动项）"
+
+        local __launchd_dir="$__loginitems_dir/Launchd"
+        local __launchagents_user_bak="$__launchd_dir/LaunchAgents/User"
+        local __launchagents_system_bak="$__launchd_dir/LaunchAgents/System"
+        local __launchdaemons_system_bak="$__launchd_dir/LaunchDaemons/System"
+
+        local __launchagents_user_dst="$ACTIVE_HOME/Library/LaunchAgents"
+        local __launchagents_system_dst="/Library/LaunchAgents"
+        local __launchdaemons_system_dst="/Library/LaunchDaemons"
+
+        # 预先备份当前状态（best effort）
+        local __stamp="$(date '+%Y%m%d-%H%M%S')"
+        local __pre_dir="$__loginitems_dir/PreRestore/Launchd/$__stamp"
+        __run_as_active_user_gui /bin/mkdir -p "$__pre_dir/LaunchAgents/User" "$__pre_dir/LaunchAgents/System" "$__pre_dir/LaunchDaemons/System" 2>/dev/null || true
+
+        if [ -d "$__launchagents_user_dst" ]; then
+            __run_as_active_user_gui /usr/bin/ditto "$__launchagents_user_dst" "$__pre_dir/LaunchAgents/User" 2>/dev/null || true
+        fi
+        if [ -d "$__launchagents_system_dst" ]; then
+            sudo $SUDO_N_FLAG /usr/bin/ditto "$__launchagents_system_dst" "$__pre_dir/LaunchAgents/System" 2>/dev/null || true
+        fi
+        if [ -d "$__launchdaemons_system_dst" ]; then
+            sudo $SUDO_N_FLAG /usr/bin/ditto "$__launchdaemons_system_dst" "$__pre_dir/LaunchDaemons/System" 2>/dev/null || true
+        fi
+
+        # 按备份镜像恢复（必要时删除新增项）
+        if ! __li_sync_dir_user "$__launchagents_user_bak" "$__launchagents_user_dst" "用户 LaunchAgents"; then
+            __ok=0
+        fi
+        if ! __li_sync_dir_root "$__launchagents_system_bak" "$__launchagents_system_dst" "系统 LaunchAgents"; then
+            __ok=0
+        fi
+        if ! __li_sync_dir_root "$__launchdaemons_system_bak" "$__launchdaemons_system_dst" "系统 LaunchDaemons"; then
+            __ok=0
+        fi
+
+        if [ "$__launchd_delete" != "1" ]; then
+            __li_warn "已禁用删除新增项（LOGINITEMS_LAUNCHD_RESTORE_DELETE=0）：可能无法完全回滚启动项"
+        fi
+        __li_info "LaunchAgents/LaunchDaemons 恢复完成后如需立即生效，建议注销或重启系统"
+    else
+        __li_info "已跳过 LaunchAgents / LaunchDaemons 恢复（LOGINITEMS_BACKUP_LAUNCHD=0）"
+    fi
+
+    # ------------------------------
+    # Extensions（尽可能恢复：pluginkit elections + systemextensionsctl 对比/卸载）
+    # ------------------------------
+    if [ -d "$__extensions_dir" ]; then
+        local __pk_all="$__extensions_dir/pluginkit_match_all.txt"
+        local __pk_elections="$__extensions_dir/pluginkit_elections.txt"
+        local __se_file="$__extensions_dir/systemextensionsctl_list.txt"
+
+        [ -s "$__pk_all" ] && __li_info "已找到 pluginkit 备份：'$__pk_all'"
+
+        # 恢复 pluginkit elections（+/-）
+        if [ -s "$__pk_elections" ]; then
+            if command -v pluginkit >/dev/null 2>&1; then
+                __li_info "开始恢复 Extensions election（pluginkit -e use/ignore）"
+                while IFS= read -r __line; do
+                    case "$__line" in
+                        +*)
+                            __id="$(printf '%s\n' "$__line" | /usr/bin/awk '{print $2}')"
+                            [ -n "$__id" ] && __run_as_active_user_gui pluginkit -e use -i "$__id" >/dev/null 2>&1 || true
+                            ;;
+                        -*)
+                            __id="$(printf '%s\n' "$__line" | /usr/bin/awk '{print $2}')"
+                            [ -n "$__id" ] && __run_as_active_user_gui pluginkit -e ignore -i "$__id" >/dev/null 2>&1 || true
+                            ;;
+                    esac
+                done < "$__pk_elections"
+                __li_ok "已尝试恢复 pluginkit elections（如需人工核对请对比：'$__pk_elections'）"
+            else
+                __li_error "未找到 pluginkit，无法恢复 Extensions elections"
+                __ok=0
+            fi
+        else
+            __li_error "未找到 pluginkit elections 备份：'$__pk_elections'"
+            __ok=0
+        fi
+
+        # System Extensions：尝试卸载“新增项”（best effort）
+        if [ -s "$__se_file" ]; then
+            __li_info "检测到 systemextensionsctl 备份：'$__se_file'"
+            local __se_backup_list="$__extensions_dir/systemextensionsctl_list.parsed"
+            local __se_current_list="$__extensions_dir/systemextensionsctl_list.current"
+            local __se_current_parsed="$__extensions_dir/systemextensionsctl_list.current.parsed"
+
+            /usr/bin/awk '{
+                for (i=1; i<=NF; i++) {
+                    if ($i ~ /^([A-Z0-9]{10}|-)$/ && (i+1)<=NF && $(i+1) ~ /\./) {
+                        print $i, $(i+1);
+                        break;
+                    }
+                }
+            }' "$__se_file" | /usr/bin/sort -u > "$__se_backup_list" 2>/dev/null || true
+
+            if command -v systemextensionsctl >/dev/null 2>&1; then
+                if __run_as_active_user_gui systemextensionsctl list 2>&1 | tee "$__se_current_list" >/dev/null; then
+                    :
+                else
+                    # 尝试提升权限再次导出（best effort）
+                    if sudo $SUDO_N_FLAG systemextensionsctl list 2>&1 | tee "$__se_current_list" >/dev/null; then
+                        sudo $SUDO_N_FLAG /usr/sbin/chown "$ACTIVE_USER" "$__se_current_list" 2>/dev/null || true
+                    else
+                        __li_warn "systemextensionsctl list 执行失败，无法对比/卸载 System Extensions"
+                        __ok=0
+                    fi
+                fi
+
+                if [ -s "$__se_current_list" ]; then
+                    /usr/bin/awk '{
+                        for (i=1; i<=NF; i++) {
+                            if ($i ~ /^([A-Z0-9]{10}|-)$/ && (i+1)<=NF && $(i+1) ~ /\./) {
+                                print $i, $(i+1);
+                                break;
+                            }
+                        }
+                    }' "$__se_current_list" | /usr/bin/sort -u > "$__se_current_parsed" 2>/dev/null || true
+
+                    if [ -s "$__se_current_parsed" ] && [ -s "$__se_backup_list" ]; then
+                        while read -r __team __bundle; do
+                            if ! /usr/bin/grep -Fq "$__team $__bundle" "$__se_backup_list"; then
+                                if [ "${SYSTEMEXTENSIONS_RESTORE_UNINSTALL:-1}" = "1" ]; then
+                                    __li_warn "发现新增 System Extension：$__team $__bundle，尝试卸载（best effort）"
+                                    sudo $SUDO_N_FLAG systemextensionsctl uninstall "$__team" "$__bundle" >/dev/null 2>&1 || true
+                                else
+                                    __li_warn "发现新增 System Extension：$__team $__bundle（未自动卸载）"
+                                fi
+                            fi
+                        done < "$__se_current_parsed"
+                    else
+                        __li_error "System Extensions 备份或当前列表为空，无法完整对比/回滚"
+                        __ok=0
+                    fi
+                fi
+            else
+                __li_warn "未找到 systemextensionsctl，无法对比/卸载 System Extensions"
+                __ok=0
+            fi
+        fi
+    else
+        __li_warn "未找到 Extensions 备份目录：'$__extensions_dir'"
+    fi
+
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+
+    if [ "$__ok" = "1" ]; then
+        echo -e "\033[1;32m[OK] 恢复 登录项与扩展  运行已完成 ✅ \033[0m"
+        echo -e "[OK] 恢复 登录项与扩展  运行已完成 ✅ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 0
+    fi
+
+    echo -e "\033[1;31m[ERROR] 恢复 登录项与扩展  未完整完成 ❌ \033[0m"
+    echo -e "[ERROR] 恢复 登录项与扩展  未完整完成 ❌ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+
+    if [ "$__strict" = "1" ]; then
+        echo -e "\033[1;31m[ERROR] 严格模式开启（LOGINITEMS_EXTENSIONS_STRICT=1）：将阻止继续执行后续恢复\033[0m"
+        echo -e "[ERROR] 严格模式开启（LOGINITEMS_EXTENSIONS_STRICT=1）：将阻止继续执行后续恢复" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 1
+    fi
+
+    echo -e "\033[1;33m[Warn] 严格模式关闭（LOGINITEMS_EXTENSIONS_STRICT=0）：将继续执行后续恢复，但该项可能未完全回滚 ⚠️ \033[0m"
+    echo -e "[Warn] 严格模式关闭（LOGINITEMS_EXTENSIONS_STRICT=0）：将继续执行后续恢复，但该项可能未完全回滚 ⚠️ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    return 0
+}
+# ================================================================================================
+# Privacy & Security（隐私与安全）
+#
+# 目标：
+#   - 在更新前对隐私与安全关键数据做可回滚备份，更新后恢复，避免安装器私自改动敏感权限
+#
+# 重点覆盖：
+#   - TCC 数据库（权限：定位/通讯录/相机/麦克风/自动化/完全磁盘访问等）
+#   - TCC 目录完整快照（包含附加文件，便于完整回滚）
+#   - Firewall（Application Firewall）
+#   - Gatekeeper（spctl master）
+#
+# 说明：
+#   - TCC 数据库读取可能需要 Terminal/脚本宿主拥有「完全磁盘访问（Full Disk Access）」权限。
+#   - 默认开启严格模式：若用户级 TCC.db 无法备份，则返回失败，中止后续更新。
+# ================================================================================================
+
+backup_privacy_security() {
+    __ensure_backup_base_vars
+    __resolve_macos_version
+
+    local __strict="${PRIVACY_SECURITY_STRICT:-1}"
+
+    # 目录名说明：
+    # - 该模块用于备份「系统设置 -> 隐私与安全」相关关键状态与数据库（重点：TCC）
+    # - 以便在系统/应用更新后，快速比对或回滚敏感授权变更（best effort）
+    local __root_dir="$BACKUP_PATH/PrivacySecurity/$BACKUP_DATE"
+    local __tcc_user_dir="$__root_dir/TCC/User"
+    local __tcc_system_dir="$__root_dir/TCC/System"
+    local __firewall_dir="$__root_dir/Firewall"
+    local __gatekeeper_dir="$__root_dir/Gatekeeper"
+    local __ok=1
+
+    # --- 打印风格（与脚本其余部分一致） ---
+    echo -e "\033[1;32m-----------------------------------------------\033[0m"
+    echo -e "\033[1;32m 备份 隐私与安全（Privacy & Security）           \033[0m"
+    echo -e "\033[1;32m-----------------------------------------------\033[0m"
+
+    echo -e "-------------------------------------------" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "备份 隐私与安全（Privacy & Security）" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "-------------------------------------------" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+
+    __ps_info() {
+        printf "\033[1;34m[Info]\033[0m "
+        printf "[Info] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __ps_ok() {
+        printf "\033[1;32m[OK]\033[0m   "
+        printf "[OK]   " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __ps_warn() {
+        printf "\033[1;33m[Warn]\033[0m "
+        printf "[Warn] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __ps_error() {
+        printf "\033[1;31m[ERROR]\033[0m  "
+        printf "[ERROR] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __ps_has_rsync() {
+        [ -x "/usr/bin/rsync" ]
+    }
+    __ps_sync_dir_user() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+        local __level="${4:-error}"
+
+        if [ ! -d "$__src" ]; then
+            __ps_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        __run_as_active_user_gui /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __ps_has_rsync; then
+            if __run_as_active_user_gui /usr/bin/rsync -a --delete "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                __ps_ok "已恢复 ${__label}（已同步并删除多余项）"
+                return 0
+            fi
+            if [ "$__level" = "warn" ]; then
+                __ps_warn "恢复 ${__label} 失败（rsync 同步失败）"
+            else
+                __ps_error "恢复 ${__label} 失败（rsync 同步失败）"
+            fi
+            return 1
+        fi
+
+        if [ "$__level" = "warn" ]; then
+            __ps_warn "未找到 rsync，无法保证 ${__label} 完整恢复"
+        else
+            __ps_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        fi
+        return 1
+    }
+    __ps_sync_dir_root() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+        local __level="${4:-error}"
+
+        if [ ! -d "$__src" ]; then
+            __ps_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        sudo $SUDO_N_FLAG /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __ps_has_rsync; then
+            if sudo $SUDO_N_FLAG /usr/bin/rsync -a --delete "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                __ps_ok "已恢复 ${__label}（已同步并删除多余项）"
+                return 0
+            fi
+            if [ "$__level" = "warn" ]; then
+                __ps_warn "恢复 ${__label} 失败（rsync 同步失败）"
+            else
+                __ps_error "恢复 ${__label} 失败（rsync 同步失败）"
+            fi
+            return 1
+        fi
+
+        if [ "$__level" = "warn" ]; then
+            __ps_warn "未找到 rsync，无法保证 ${__label} 完整恢复"
+        else
+            __ps_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        fi
+        return 1
+    }
+    __ps_has_rsync() {
+        [ -x "/usr/bin/rsync" ]
+    }
+    __ps_sync_dir_user() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+
+        if [ ! -d "$__src" ]; then
+            __ps_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        __run_as_active_user_gui /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __ps_has_rsync; then
+            if __run_as_active_user_gui /usr/bin/rsync -a --delete "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                __ps_ok "已恢复 ${__label}（已同步并删除多余项）"
+                return 0
+            fi
+            __ps_error "恢复 ${__label} 失败（rsync 同步失败）"
+            return 1
+        fi
+
+        __ps_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        return 1
+    }
+    __ps_sync_dir_root() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+        local __level="${4:-error}"
+
+        if [ ! -d "$__src" ]; then
+            __ps_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        sudo $SUDO_N_FLAG /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __ps_has_rsync; then
+            if sudo $SUDO_N_FLAG /usr/bin/rsync -a --delete "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                __ps_ok "已恢复 ${__label}（已同步并删除多余项）"
+                return 0
+            fi
+            if [ "$__level" = "warn" ]; then
+                __ps_warn "恢复 ${__label} 失败（rsync 同步失败）"
+            else
+                __ps_error "恢复 ${__label} 失败（rsync 同步失败）"
+            fi
+            return 1
+        fi
+
+        if [ "$__level" = "warn" ]; then
+            __ps_warn "未找到 rsync，无法保证 ${__label} 完整恢复"
+        else
+            __ps_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        fi
+        return 1
+    }
+    __ps_has_rsync() {
+        [ -x "/usr/bin/rsync" ]
+    }
+    __ps_sync_dir_user() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+
+        if [ ! -d "$__src" ]; then
+            __ps_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        __run_as_active_user_gui /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __ps_has_rsync; then
+            if __run_as_active_user_gui /usr/bin/rsync -a --delete "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                __ps_ok "已恢复 ${__label}（已同步并删除多余项）"
+                return 0
+            fi
+            __ps_error "恢复 ${__label} 失败（rsync 同步失败）"
+            return 1
+        fi
+
+        __ps_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        return 1
+    }
+    __ps_sync_dir_root() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+        local __level="${4:-error}"
+
+        if [ ! -d "$__src" ]; then
+            __ps_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        sudo $SUDO_N_FLAG /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __ps_has_rsync; then
+            if sudo $SUDO_N_FLAG /usr/bin/rsync -a --delete "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                __ps_ok "已恢复 ${__label}（已同步并删除多余项）"
+                return 0
+            fi
+            if [ "$__level" = "warn" ]; then
+                __ps_warn "恢复 ${__label} 失败（rsync 同步失败）"
+            else
+                __ps_error "恢复 ${__label} 失败（rsync 同步失败）"
+            fi
+            return 1
+        fi
+
+        if [ "$__level" = "warn" ]; then
+            __ps_warn "未找到 rsync，无法保证 ${__label} 完整恢复"
+        else
+            __ps_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        fi
+        return 1
+    }
+    __ps_has_rsync() {
+        [ -x "/usr/bin/rsync" ]
+    }
+    __ps_copy_dir_user() {
+        local __src="$1"
+        local __dst="$2"
+        if __ps_has_rsync; then
+            __run_as_active_user_gui /usr/bin/rsync -a "$__src/" "$__dst/" 2>/dev/null
+        else
+            __run_as_active_user_gui /usr/bin/ditto "$__src" "$__dst" 2>/dev/null
+        fi
+    }
+    __ps_copy_dir_root() {
+        local __src="$1"
+        local __dst="$2"
+        if __ps_has_rsync; then
+            sudo $SUDO_N_FLAG /usr/bin/rsync -a "$__src/" "$__dst/" 2>/dev/null
+        else
+            sudo $SUDO_N_FLAG /usr/bin/ditto "$__src" "$__dst" 2>/dev/null
+        fi
+    }
+
+    __ps_info "macOS 版本：${MACOS_PRODUCT_VERSION:-Unknown} (${MACOS_BUILD_VERSION:-Unknown})"
+    __ps_info "备份路径：'${__root_dir}'"
+
+    __run_as_active_user_gui /bin/mkdir -p "$__tcc_user_dir" "$__tcc_system_dir" "$__firewall_dir" "$__gatekeeper_dir" 2>/dev/null || true
+
+    # -----------------------
+    # 1) TCC（User）
+    # -----------------------
+    local __tcc_user_db="$ACTIVE_HOME/Library/Application Support/com.apple.TCC/TCC.db"
+    local __tcc_user_backup_db="$__tcc_user_dir/TCC.db"
+    local __tcc_user_dir_src="$ACTIVE_HOME/Library/Application Support/com.apple.TCC"
+    local __tcc_user_dir_backup="$__tcc_user_dir/FullDir"
+
+    if [ -f "$__tcc_user_db" ]; then
+        if command -v sqlite3 >/dev/null 2>&1; then
+            if __run_as_active_user_gui sqlite3 "$__tcc_user_db" ".backup '$__tcc_user_backup_db'" >/dev/null 2>&1; then
+                if [ -s "$__tcc_user_backup_db" ]; then
+                    __ps_ok "已备份 User TCC.db（sqlite3 .backup）：'$__tcc_user_backup_db'"
+                else
+                    __ps_error "备份 User TCC.db 失败（sqlite3 .backup 成功但文件为空）"
+                    __ok=0
+                fi
+            else
+                __ps_error "备份 User TCC.db 失败（sqlite3 .backup 执行失败；可能缺少 Full Disk Access）"
+                __ok=0
+            fi
+        else
+            # fallback：直接 copy（可能被系统保护拦截）
+            __run_as_active_user_gui /bin/cp -f "$__tcc_user_db" "$__tcc_user_backup_db" 2>/dev/null || true
+            if [ -s "$__tcc_user_backup_db" ]; then
+                __ps_ok "已备份 User TCC.db（cp）：'$__tcc_user_backup_db'"
+            else
+                __ps_error "备份 User TCC.db 失败（cp 后文件为空；可能缺少 Full Disk Access）"
+                __ok=0
+            fi
+        fi
+    else
+        __ps_error "未找到 User TCC.db：'$__tcc_user_db'（可能路径变化或受系统保护）"
+        __ok=0
+    fi
+
+    # 1.1) TCC（User 全目录）
+    if [ -d "$__tcc_user_dir_src" ]; then
+        __run_as_active_user_gui /bin/mkdir -p "$__tcc_user_dir_backup" 2>/dev/null || true
+        if __ps_copy_dir_user "$__tcc_user_dir_src" "$__tcc_user_dir_backup"; then
+            __ps_ok "已备份 User TCC 目录：'$__tcc_user_dir_backup'"
+        else
+            __ps_error "备份 User TCC 目录失败：'$__tcc_user_dir_src'"
+            __ok=0
+        fi
+    else
+        __ps_error "未找到 User TCC 目录：'$__tcc_user_dir_src'"
+        __ok=0
+    fi
+
+    # -----------------------
+    # 2) TCC（System）— best effort
+    # -----------------------
+    local __tcc_sys_db="/Library/Application Support/com.apple.TCC/TCC.db"
+    local __tcc_sys_backup_db="$__tcc_system_dir/TCC.db"
+    local __tcc_sys_dir_src="/Library/Application Support/com.apple.TCC"
+    local __tcc_sys_dir_backup="$__tcc_system_dir/FullDir"
+
+    if [ -f "$__tcc_sys_db" ]; then
+        sudo $SUDO_N_FLAG /bin/cp -f "$__tcc_sys_db" "$__tcc_sys_backup_db" 2>/dev/null || true
+        sudo $SUDO_N_FLAG /usr/sbin/chown "$ACTIVE_USER" "$__tcc_sys_backup_db" 2>/dev/null || true
+        if [ -s "$__tcc_sys_backup_db" ]; then
+            __ps_ok "已备份 System TCC.db：'$__tcc_sys_backup_db'（best effort）"
+        else
+            __ps_error "备份 System TCC.db 失败（可能需要 sudo 权限或受系统保护）"
+            __ok=0
+        fi
+    else
+        __ps_info "未发现 System TCC.db（可能不存在/已迁移/受保护），已跳过系统级 TCC 备份"
+    fi
+
+    if [ -d "$__tcc_sys_dir_src" ]; then
+        __run_as_active_user_gui /bin/mkdir -p "$__tcc_sys_dir_backup" 2>/dev/null || true
+        if __ps_copy_dir_root "$__tcc_sys_dir_src" "$__tcc_sys_dir_backup"; then
+            sudo $SUDO_N_FLAG /usr/sbin/chown -R "$ACTIVE_USER" "$__tcc_sys_dir_backup" 2>/dev/null || true
+            __ps_ok "已备份 System TCC 目录：'$__tcc_sys_dir_backup'（best effort）"
+        else
+            __ps_error "备份 System TCC 目录失败（可能需要 sudo 权限或受系统保护）"
+            __ok=0
+        fi
+    fi
+
+    # -----------------------
+    # 3) Firewall（Application Firewall）
+    # -----------------------
+    local __alf_plist="/Library/Preferences/com.apple.alf.plist"
+    local __alf_backup="$__firewall_dir/com.apple.alf.plist"
+
+    if [ -f "$__alf_plist" ]; then
+        # 用 tee 写入到备份目录，确保文件归属为用户（而不是 root）
+        sudo $SUDO_N_FLAG /bin/cat "$__alf_plist" 2>/dev/null | tee "$__alf_backup" >/dev/null || true
+        if [ -s "$__alf_backup" ]; then
+            __ps_ok "已备份 Firewall 配置：'$__alf_plist'"
+        else
+            __ps_warn "Firewall 配置备份失败（可能无权限或文件受保护）：'$__alf_plist'"
+        fi
+    else
+        __ps_info "未发现 Firewall 配置文件：'$__alf_plist'（可能已迁移/不存在）"
+    fi
+
+    if [ -x "/usr/libexec/ApplicationFirewall/socketfilterfw" ]; then
+        {
+            echo "### socketfilterfw status $(date '+%Y-%m-%d %H:%M:%S')"
+            sudo $SUDO_N_FLAG /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>&1 || true
+            sudo $SUDO_N_FLAG /usr/libexec/ApplicationFirewall/socketfilterfw --getstealthmode 2>&1 || true
+            sudo $SUDO_N_FLAG /usr/libexec/ApplicationFirewall/socketfilterfw --getloggingmode 2>&1 || true
+        } | tee "$__firewall_dir/socketfilterfw_status.txt" >/dev/null 2>&1 || true
+        [ -s "$__firewall_dir/socketfilterfw_status.txt" ] && __ps_ok "已导出 Firewall 状态：'$__firewall_dir/socketfilterfw_status.txt'"
+    fi
+
+    # -----------------------
+    # 4) Gatekeeper（spctl）
+    # -----------------------
+    if command -v spctl >/dev/null 2>&1; then
+        sudo $SUDO_N_FLAG spctl --status 2>&1 | tee "$__gatekeeper_dir/spctl_status.txt" >/dev/null || true
+        [ -s "$__gatekeeper_dir/spctl_status.txt" ] && __ps_ok "已导出 Gatekeeper 状态：'$__gatekeeper_dir/spctl_status.txt'"
+    fi
+
+    # 附加：记录 FileVault / SIP 状态（审计用，不自动回滚）
+    if command -v fdesetup >/dev/null 2>&1; then
+        sudo $SUDO_N_FLAG fdesetup status 2>&1 | tee "$__root_dir/fdesetup_status.txt" >/dev/null || true
+        [ -s "$__root_dir/fdesetup_status.txt" ] && __ps_ok "已导出 FileVault 状态：'$__root_dir/fdesetup_status.txt'"
+    fi
+    if command -v csrutil >/dev/null 2>&1; then
+        csrutil status 2>&1 | tee "$__root_dir/csrutil_status.txt" >/dev/null || true
+        [ -s "$__root_dir/csrutil_status.txt" ] && __ps_ok "已导出 SIP 状态：'$__root_dir/csrutil_status.txt'"
+    fi
+
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+
+    if [ "$__ok" = "1" ]; then
+        echo -e "\033[1;32m[OK] 备份 隐私与安全  运行已完成 ✅ \033[0m"
+        echo -e "[OK] 备份 隐私与安全  运行已完成 ✅ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 0
+    fi
+
+    echo -e "\033[1;31m[ERROR] 备份 隐私与安全  未完整完成 ❌ \033[0m"
+    echo -e "[ERROR] 备份 隐私与安全  未完整完成 ❌ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+
+    if [ "$__strict" = "1" ]; then
+        echo -e "\033[1;31m[ERROR] 严格模式开启（PRIVACY_SECURITY_STRICT=1）：将阻止继续执行更新，避免无法回滚\033[0m"
+        echo -e "[ERROR] 严格模式开启（PRIVACY_SECURITY_STRICT=1）：将阻止继续执行更新，避免无法回滚" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 1
+    fi
+
+    echo -e "\033[1;33m[Warn] 严格模式关闭（PRIVACY_SECURITY_STRICT=0）：将继续执行更新，但回滚能力可能不完整 ⚠️ \033[0m"
+    echo -e "[Warn] 严格模式关闭（PRIVACY_SECURITY_STRICT=0）：将继续执行更新，但回滚能力可能不完整 ⚠️ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    return 0
+}
+
+restore_privacy_security() {
+    __ensure_backup_base_vars
+    __resolve_macos_version
+
+    local __strict="${PRIVACY_SECURITY_STRICT:-1}"
+
+    # 兼容旧目录名：PrivacyAndSecurity -> PrivacySecurity
+    local __root_dir_new="$BACKUP_PATH/PrivacySecurity/$BACKUP_DATE"
+    local __root_dir_old="$BACKUP_PATH/PrivacyAndSecurity/$BACKUP_DATE"
+    local __root_dir="$__root_dir_new"
+    if [ ! -d "$__root_dir_new" ] && [ -d "$__root_dir_old" ]; then
+        __root_dir="$__root_dir_old"
+    fi
+
+    local __tcc_user_backup_db="$__root_dir/TCC/User/TCC.db"
+    local __tcc_sys_backup_db="$__root_dir/TCC/System/TCC.db"
+    local __tcc_user_backup_dir="$__root_dir/TCC/User/FullDir"
+    local __tcc_sys_backup_dir="$__root_dir/TCC/System/FullDir"
+    local __firewall_dir="$__root_dir/Firewall"
+    local __gatekeeper_dir="$__root_dir/Gatekeeper"
+
+    local __ok=1
+
+    # --- 打印风格（与脚本其余部分一致） ---
+    echo -e "\033[1;32m-----------------------------------------------\033[0m"
+    echo -e "\033[1;32m 恢复 隐私与安全（Privacy & Security）           \033[0m"
+    echo -e "\033[1;32m-----------------------------------------------\033[0m"
+
+    echo -e "-------------------------------------------" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "恢复 隐私与安全（Privacy & Security）" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "-------------------------------------------" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+
+    __ps_info() {
+        printf "\033[1;34m[Info]\033[0m "
+        printf "[Info] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __ps_ok() {
+        printf "\033[1;32m[OK]\033[0m   "
+        printf "[OK]   " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __ps_warn() {
+        printf "\033[1;33m[Warn]\033[0m "
+        printf "[Warn] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __ps_error() {
+        printf "\033[1;31m[ERROR]\033[0m  "
+        printf "[ERROR] " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "$*" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    }
+    __ps_has_rsync() {
+        [ -x "/usr/bin/rsync" ]
+    }
+    __ps_sync_dir_user() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+        local __level="${4:-error}"
+
+        if [ ! -d "$__src" ]; then
+            __ps_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        __run_as_active_user_gui /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __ps_has_rsync; then
+            if __run_as_active_user_gui /usr/bin/rsync -a --delete "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                __ps_ok "已恢复 ${__label}（已同步并删除多余项）"
+                return 0
+            fi
+            if [ "$__level" = "warn" ]; then
+                __ps_warn "恢复 ${__label} 失败（rsync 同步失败）"
+            else
+                __ps_error "恢复 ${__label} 失败（rsync 同步失败）"
+            fi
+            return 1
+        fi
+
+        if [ "$__level" = "warn" ]; then
+            __ps_warn "未找到 rsync，无法保证 ${__label} 完整恢复"
+        else
+            __ps_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        fi
+        return 1
+    }
+    __ps_sync_dir_root() {
+        local __src="$1"
+        local __dst="$2"
+        local __label="$3"
+        local __level="${4:-error}"
+
+        if [ ! -d "$__src" ]; then
+            __ps_warn "未找到 ${__label} 备份目录：'$__src'"
+            return 1
+        fi
+
+        sudo $SUDO_N_FLAG /bin/mkdir -p "$__dst" 2>/dev/null || true
+        if __ps_has_rsync; then
+            if sudo $SUDO_N_FLAG /usr/bin/rsync -a --delete "$__src/" "$__dst/" 2>&1 | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" >/dev/null; then
+                __ps_ok "已恢复 ${__label}（已同步并删除多余项）"
+                return 0
+            fi
+            if [ "$__level" = "warn" ]; then
+                __ps_warn "恢复 ${__label} 失败（rsync 同步失败）"
+            else
+                __ps_error "恢复 ${__label} 失败（rsync 同步失败）"
+            fi
+            return 1
+        fi
+
+        if [ "$__level" = "warn" ]; then
+            __ps_warn "未找到 rsync，无法保证 ${__label} 完整恢复"
+        else
+            __ps_error "未找到 rsync，无法保证 ${__label} 完整恢复"
+        fi
+        return 1
+    }
+
+    __ps_info "macOS 版本：${MACOS_PRODUCT_VERSION:-Unknown} (${MACOS_BUILD_VERSION:-Unknown})"
+    __ps_info "恢复来源：'${__root_dir}'"
+
+    if [ ! -d "$__root_dir" ]; then
+        __ps_error "未找到备份目录：'$__root_dir_new'（或旧目录：'$__root_dir_old'），无法恢复 Privacy & Security"
+        if [ "$__strict" = "1" ]; then
+            __ps_error "严格模式开启（PRIVACY_SECURITY_STRICT=1）：将阻止继续执行后续恢复"
+            echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+            echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+            return 1
+        fi
+        __ps_warn "严格模式关闭（PRIVACY_SECURITY_STRICT=0）：跳过本项恢复"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 0
+    fi
+
+    # -----------------------
+    # 1) 恢复 TCC（User 目录 + 数据库）— 关键项
+    # -----------------------
+    local __tcc_user_db="$ACTIVE_HOME/Library/Application Support/com.apple.TCC/TCC.db"
+    local __tcc_user_dir="$ACTIVE_HOME/Library/Application Support/com.apple.TCC"
+
+    # 1.1) 恢复 TCC（User 目录，包含附加文件）
+    if ! __ps_sync_dir_user "$__tcc_user_backup_dir" "$__tcc_user_dir" "User TCC 目录" "warn"; then
+        __ps_warn "User TCC 目录恢复失败（可能缺少完全磁盘访问权限）"
+    fi
+
+    if [ -s "$__tcc_user_backup_db" ]; then
+        __run_as_active_user_gui /bin/mkdir -p "$__tcc_user_dir" 2>/dev/null || true
+
+        # 先停掉 tccd（best effort），避免被占用
+        if [ -n "${ACTIVE_UID:-}" ]; then
+            /usr/bin/pkill -u "$ACTIVE_UID" -x tccd 2>/dev/null || true
+        fi
+
+        __run_as_active_user_gui /bin/cp -f "$__tcc_user_backup_db" "$__tcc_user_db" 2>/dev/null || true
+        __run_as_active_user_gui /bin/rm -f "$__tcc_user_db-wal" "$__tcc_user_db-shm" 2>/dev/null || true
+
+        local __src_sha="" __dst_sha=""
+        if command -v shasum >/dev/null 2>&1; then
+            __src_sha="$(shasum -a 256 "$__tcc_user_backup_db" 2>/dev/null | awk '{print $1}' || true)"
+            __dst_sha="$(shasum -a 256 "$__tcc_user_db" 2>/dev/null | awk '{print $1}' || true)"
+        fi
+
+        if [ -s "$__tcc_user_db" ] && { [ -z "$__src_sha" ] || [ "$__src_sha" = "$__dst_sha" ]; }; then
+            __ps_ok "已恢复 User TCC.db：'$__tcc_user_db'"
+        else
+            __ps_warn "恢复 User TCC.db 失败：目标文件不存在/为空，或 hash 不一致（可能受系统保护）"
+        fi
+    else
+        __ps_warn "未找到 User TCC.db 备份：'$__tcc_user_backup_db'"
+    fi
+
+    # -----------------------
+    # 2) 恢复 TCC（System）— best effort
+    # -----------------------
+    local __tcc_sys_db="/Library/Application Support/com.apple.TCC/TCC.db"
+    local __tcc_sys_dir="/Library/Application Support/com.apple.TCC"
+    if [ -s "$__tcc_sys_backup_db" ]; then
+        sudo $SUDO_N_FLAG /bin/mkdir -p "$__tcc_sys_dir" 2>/dev/null || true
+        sudo $SUDO_N_FLAG /usr/bin/pkill -x tccd 2>/dev/null || true
+        sudo $SUDO_N_FLAG /bin/cp -f "$__tcc_sys_backup_db" "$__tcc_sys_db" 2>/dev/null || true
+        sudo $SUDO_N_FLAG /bin/rm -f "$__tcc_sys_db-wal" "$__tcc_sys_db-shm" 2>/dev/null || true
+
+        local __sys_src_sha="" __sys_dst_sha=""
+        if command -v shasum >/dev/null 2>&1; then
+            __sys_src_sha="$(shasum -a 256 "$__tcc_sys_backup_db" 2>/dev/null | awk '{print $1}' || true)"
+            __sys_dst_sha="$(shasum -a 256 "$__tcc_sys_db" 2>/dev/null | awk '{print $1}' || true)"
+        fi
+
+        if [ -s "$__tcc_sys_db" ] && { [ -z "$__sys_src_sha" ] || [ "$__sys_src_sha" = "$__sys_dst_sha" ]; }; then
+            __ps_ok "已恢复 System TCC.db：'$__tcc_sys_db'（best effort）"
+        else
+            __ps_warn "恢复 System TCC.db 失败：目标文件不存在/为空，或 hash 不一致（可能受系统保护）"
+        fi
+    else
+        __ps_info "未发现 System TCC.db 备份，已跳过系统级 TCC 恢复"
+    fi
+
+    # 2.1) 恢复 TCC（System 目录，best effort）
+    if ! __ps_sync_dir_root "$__tcc_sys_backup_dir" "$__tcc_sys_dir" "System TCC 目录" "warn"; then
+        __ps_warn "System TCC 目录恢复失败（可能受系统保护）"
+        if command -v csrutil >/dev/null 2>&1; then
+            __ps_warn "SIP 状态：$(csrutil status 2>/dev/null | tr -d '\n')（如需完整恢复需在恢复模式禁用 SIP）"
+        fi
+    fi
+
+    # -----------------------
+    # 3) 恢复 Firewall
+    # -----------------------
+    local __alf_backup="$__firewall_dir/com.apple.alf.plist"
+    if [ -s "$__alf_backup" ]; then
+        sudo $SUDO_N_FLAG /bin/cp -f "$__alf_backup" "/Library/Preferences/com.apple.alf.plist" 2>/dev/null || true
+        __ps_ok "已尝试恢复 Firewall 配置：/Library/Preferences/com.apple.alf.plist"
+    else
+        __ps_info "未发现 Firewall plist 备份，已跳过 plist 恢复"
+    fi
+
+    # 尝试按备份状态设置 globalstate/stealth/logging（best effort）
+    local __fw_status_file="$__firewall_dir/socketfilterfw_status.txt"
+    if [ -s "$__fw_status_file" ] && [ -x "/usr/libexec/ApplicationFirewall/socketfilterfw" ]; then
+        local __want_global=""
+        if grep -qi "State = 1" "$__fw_status_file"; then
+            __want_global="on"
+        elif grep -qi "State = 0" "$__fw_status_file"; then
+            __want_global="off"
+        fi
+
+        if [ -n "$__want_global" ]; then
+            sudo $SUDO_N_FLAG /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate "$__want_global" >/dev/null 2>&1 || true
+        fi
+
+        if grep -qi "Stealth mode enabled" "$__fw_status_file"; then
+            sudo $SUDO_N_FLAG /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode on >/dev/null 2>&1 || true
+        elif grep -qi "Stealth mode disabled" "$__fw_status_file"; then
+            sudo $SUDO_N_FLAG /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode off >/dev/null 2>&1 || true
+        fi
+
+        if grep -qi "Logging mode enabled" "$__fw_status_file"; then
+            sudo $SUDO_N_FLAG /usr/libexec/ApplicationFirewall/socketfilterfw --setloggingmode on >/dev/null 2>&1 || true
+        elif grep -qi "Logging mode disabled" "$__fw_status_file"; then
+            sudo $SUDO_N_FLAG /usr/libexec/ApplicationFirewall/socketfilterfw --setloggingmode off >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # -----------------------
+    # 4) 恢复 Gatekeeper（spctl master）
+    # -----------------------
+    local __spctl_backup="$__gatekeeper_dir/spctl_status.txt"
+    if [ -s "$__spctl_backup" ] && command -v spctl >/dev/null 2>&1; then
+        if grep -qi "assessments enabled" "$__spctl_backup"; then
+            sudo $SUDO_N_FLAG spctl --master-enable >/dev/null 2>&1 || true
+            __ps_ok "已按备份恢复 Gatekeeper：enabled"
+        elif grep -qi "assessments disabled" "$__spctl_backup"; then
+            sudo $SUDO_N_FLAG spctl --master-disable >/dev/null 2>&1 || true
+            __ps_ok "已按备份恢复 Gatekeeper：disabled"
+        else
+            __ps_info "spctl_status.txt 格式不符合预期，已跳过 Gatekeeper 自动恢复（请手动核对）"
+        fi
+    else
+        __ps_info "未发现 Gatekeeper 备份或 spctl 不可用，已跳过 Gatekeeper 恢复"
+    fi
+
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+
+    if [ "$__ok" = "1" ]; then
+        echo -e "\033[1;32m[OK] 恢复 隐私与安全  运行已完成 ✅ \033[0m"
+        echo -e "[OK] 恢复 隐私与安全  运行已完成 ✅ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 0
+    fi
+
+    echo -e "\033[1;31m[ERROR] 恢复 隐私与安全  未完整完成 ❌ \033[0m"
+    echo -e "[ERROR] 恢复 隐私与安全  未完整完成 ❌ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+
+    if [ "$__strict" = "1" ]; then
+        echo -e "\033[1;31m[ERROR] 严格模式开启（PRIVACY_SECURITY_STRICT=1）：将阻止继续执行后续恢复\033[0m"
+        echo -e "[ERROR] 严格模式开启（PRIVACY_SECURITY_STRICT=1）：将阻止继续执行后续恢复" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+        return 1
+    fi
+
+    echo -e "\033[1;33m[Warn] 严格模式关闭（PRIVACY_SECURITY_STRICT=0）：将继续执行后续恢复，但该项可能未完全回滚 ⚠️ \033[0m"
+    echo -e "[Warn] 严格模式关闭（PRIVACY_SECURITY_STRICT=0）：将继续执行后续恢复，但该项可能未完全回滚 ⚠️ " | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE" > /dev/null
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    echo -e "" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    return 0
+}
+
+# ************************* #
+# 自定义函数： GUI 会话里弹通知或对话框
+# ************************* #
+
+
+# ----------------------------------
+# 备份：LoginItems & Extensions（登录项与扩展）
+# ----------------------------------
+if ! backup_loginitems_extensions; then
+    echo -e "[FATAL] LoginItems & Extensions 备份不完整，已中止（如确需继续，可设置 LOGINITEMS_EXTENSIONS_STRICT=0）" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    exit 1
+fi
+
+# ----------------------------------
+# 备份：Privacy & Security（隐私与安全）
+# ----------------------------------
+if ! backup_privacy_security; then
+    echo -e "[FATAL] Privacy & Security 备份不完整，已中止（如确需继续，可设置 PRIVACY_SECURITY_STRICT=0）" | tee -a "$LOG_FULL_LAST" "$LOG_FULL_FILE"
+    exit 1
+fi
